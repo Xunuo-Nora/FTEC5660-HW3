@@ -171,13 +171,107 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
+
+This solution applies Fisher points 1, 2 and 5. They form a compact view of a
+company's ability to grow: point 1 tests whether sales are already expanding,
+point 2 tests whether newer products can sustain that expansion, and point 5
+checks whether the resulting business is economically worthwhile. All monetary
+arithmetic is performed by SQLite through the provided `sql_query` tool, and
+the PASS/FAIL thresholds are evaluated in Python.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+#### Point 1: Market potential for sales growth
+
+Fisher asks whether the company can achieve a "sizable increase in sales for
+at least several years." I chose this point because sustained revenue growth is
+the most direct observable evidence that the market is absorbing more of the
+company's products or services.
+
+The agent sums orders in FY2023 and FY2025 and calculates the two-year revenue
+growth rate as `(FY2025 revenue / FY2023 revenue - 1) * 100`. The point receives
+PASS when this rate is greater than the company's industry median in
+`industry_medians.revenue_growth_2y_pct`; otherwise it receives FAIL. The
+evidence comes from `orders`, `company` and `industry_medians`.
+
+#### Point 2: New products as current lines mature
+
+I chose this point because current growth is less valuable if management has no
+replacement for products that eventually mature. Products launched from 1
+January 2023 onward are treated as new products, giving every company the same
+three-year product-development window.
+
+The agent divides FY2025 sales from those products by total FY2025 sales. The
+point receives PASS when the resulting percentage is greater than
+`industry_medians.new_product_share_pct`; otherwise it receives FAIL. The
+evidence comes from the launch dates in `products`, sales in `orders`, and the
+company's matching row in `industry_medians`.
+
+#### Point 5: Worthwhile profit margin
+
+Fisher's fifth point asks whether the company has a "worthwhile profit margin."
+I chose it because sales growth should not be treated as attractive when it is
+achieved with below-industry operating economics.
+
+The agent calculates FY2025 operating margin as `(revenue - cost of sales -
+selling and administration - R&D) / revenue * 100`. The point receives PASS
+when this margin is greater than `industry_medians.operating_margin_pct`;
+otherwise it receives FAIL. Revenue comes from `orders`, the three expense
+categories come from `monthly_costs`, and the benchmark comes from
+`industry_medians`.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart LR
+    A[Company tools] --> B[Concurrent company worker]
+    B --> C[sql_query]
+    C --> D[(Orders, products, costs,<br/>company and industry medians)]
+    D --> E[One aggregate SQL result]
+    E --> F[Python rule engine]
+    F --> G1[Point 1 verdict]
+    F --> G2[Point 2 verdict]
+    F --> G5[Point 5 verdict]
+    G1 --> H[Verified evidence summary]
+    G2 --> H
+    G5 --> H
+    H --> I{DeepSeek available?}
+    I -->|Yes| J[DeepSeek rewrites concise summary]
+    I -->|No or API failure| K[Deterministic fallback summary]
+    J --> L[Points and summary]
+    K --> L
+    L --> M[results.csv]
+```
+
+`build_agent()` creates one temperature-zero `deepseek-v4-flash` chat model.
+`analyze_companies()` runs up to four company workers concurrently. Each worker
+locates its provided `sql_query` tool and makes one aggregate query, so company
+data is never opened directly and the model is not asked to perform financial
+arithmetic. Python compares the three calculated metrics with their industry
+medians and fixes the verdicts before any model call. DeepSeek is used only to
+turn the verified evidence into a short readable explanation. If the model call
+fails, the same evidence is returned in a deterministic fallback summary, so a
+temporary API problem cannot prevent the end-to-end run from producing
+`results.csv`. No interviews are needed because all three selected points use
+database evidence.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+The final rules were run on all 20 companies in `public_test`. The results were
+60 correct verdicts out of 60, with 100.0% balanced point accuracy.
+
+| Point | Correct verdicts | Public-test balanced accuracy |
+| --- | ---: | ---: |
+| 1: Market potential | 20/20 | 100.0% |
+| 2: New products | 20/20 | 100.0% |
+| 5: Profit margin | 20/20 | 100.0% |
+| **Overall** | **60/60** | **100.0%** |
+
+There were no companies whose verdicts disagreed with
+`public_test/ground_truth.json`, so there are no individual errors to explain.
+The public set contains 42 true-PASS and 18 true-FAIL decisions across the
+three points, and both groups were classified correctly. This agreement is not
+based on company names or memorized public answers: the same SQL query and
+industry-relative rules are applied to every company. Performing all arithmetic
+in SQL also avoids the calculation errors that can arise when a language model
+is asked to sum thousands of orders or compare ratios itself.

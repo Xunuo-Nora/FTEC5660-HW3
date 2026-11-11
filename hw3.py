@@ -57,7 +57,107 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 2, 5]  ### YOUR CODE HERE
+
+
+# One aggregate query supplies every figure needed for the three rules.  Keeping
+# the arithmetic in SQLite makes the verdicts reproducible and avoids asking the
+# language model to add or divide long financial series.
+_METRIC_QUERY = """
+WITH
+revenue AS (
+    SELECT
+        SUM(CASE WHEN order_date BETWEEN '2023-01-01' AND '2023-12-31'
+                 THEN amount ELSE 0 END) AS revenue_2023,
+        SUM(CASE WHEN order_date BETWEEN '2025-01-01' AND '2025-12-31'
+                 THEN amount ELSE 0 END) AS revenue_2025
+    FROM orders
+),
+new_product_sales AS (
+    SELECT SUM(o.amount) AS sales
+    FROM orders AS o
+    JOIN products AS p ON p.product = o.product
+    WHERE o.order_date BETWEEN '2025-01-01' AND '2025-12-31'
+      AND p.launch_date >= '2023-01-01'
+),
+costs AS (
+    SELECT
+        SUM(CASE WHEN month BETWEEN '2025-01' AND '2025-12'
+                 THEN cost_of_sales ELSE 0 END) AS cost_of_sales,
+        SUM(CASE WHEN month BETWEEN '2025-01' AND '2025-12'
+                 THEN selling_admin ELSE 0 END) AS selling_admin,
+        SUM(CASE WHEN month BETWEEN '2025-01' AND '2025-12'
+                 THEN research_development ELSE 0 END) AS research_development
+    FROM monthly_costs
+),
+benchmarks AS (
+    SELECT m.*
+    FROM company AS c
+    JOIN industry_medians AS m ON m.industry = c.industry
+)
+SELECT
+    ROUND(100.0 * (revenue_2025 / NULLIF(revenue_2023, 0) - 1.0), 4)
+        AS revenue_growth_2y_pct,
+    ROUND(100.0 * sales / NULLIF(revenue_2025, 0), 4)
+        AS new_product_share_pct,
+    ROUND(100.0 * (revenue_2025 - cost_of_sales - selling_admin
+                   - research_development) / NULLIF(revenue_2025, 0), 4)
+        AS operating_margin_pct,
+    benchmarks.revenue_growth_2y_pct AS median_growth,
+    benchmarks.new_product_share_pct AS median_new_share,
+    benchmarks.operating_margin_pct AS median_margin
+FROM revenue, new_product_sales, costs, benchmarks
+"""
+
+
+def _parse_metric_row(raw: str) -> dict[str, float]:
+    """Parse the single-row table returned by the provided SQL tool."""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) != 2 or raw.startswith("SQL error:"):
+        raise ValueError(f"unexpected SQL result: {raw!r}")
+    columns = [item.strip() for item in lines[0].split("|")]
+    values = [item.strip() for item in lines[1].split("|")]
+    if len(columns) != len(values):
+        raise ValueError(f"SQL columns and values do not match: {raw!r}")
+    metrics = dict(zip(columns, map(float, values)))
+    required = {
+        "revenue_growth_2y_pct", "new_product_share_pct", "operating_margin_pct",
+        "median_growth", "median_new_share", "median_margin",
+    }
+    if not required.issubset(metrics):
+        raise ValueError(f"SQL result is missing metrics: {required - metrics.keys()}")
+    return metrics
+
+
+def _fallback_summary(metrics: dict[str, float], points: dict[int, str]) -> str:
+    """Return a complete evidence summary without relying on another API call."""
+    return (
+        f"Point 1 is {points[1]}: two-year revenue growth was "
+        f"{metrics['revenue_growth_2y_pct']:.1f}% versus the industry median of "
+        f"{metrics['median_growth']:.1f}%. "
+        f"Point 2 is {points[2]}: products launched since 2023 supplied "
+        f"{metrics['new_product_share_pct']:.1f}% of FY2025 sales versus "
+        f"{metrics['median_new_share']:.1f}% for the industry. "
+        f"Point 5 is {points[5]}: the FY2025 operating margin was "
+        f"{metrics['operating_margin_pct']:.1f}% versus the industry median of "
+        f"{metrics['median_margin']:.1f}%."
+    )
+
+
+def _message_text(message: Any) -> str:
+    """Extract plain text from the common LangChain message content forms."""
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "\n".join(parts).strip()
+    return str(content).strip()
 
 
 def build_agent() -> Any:
@@ -72,7 +172,21 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    import os
+
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        # Verdicts remain fully deterministic, and the fallback summary lets a
+        # missing local key produce results.csv instead of crashing the run.
+        return None
+
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        timeout=90,
+        max_retries=2,
+    )
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +223,74 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(4)
+
+    async def analyze_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                sql_tool = next(tool for tool in tools if getattr(tool, "name", "") == "sql_query")
+                last_error: Exception | None = None
+                metrics: dict[str, float] | None = None
+                for _ in range(2):
+                    try:
+                        raw = await asyncio.to_thread(
+                            sql_tool.invoke, {"query": _METRIC_QUERY}
+                        )
+                        metrics = _parse_metric_row(str(raw))
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                if metrics is None:
+                    assert last_error is not None
+                    raise last_error
+
+                points = {
+                    1: "PASS" if metrics["revenue_growth_2y_pct"] > metrics["median_growth"] else "FAIL",
+                    2: "PASS" if metrics["new_product_share_pct"] > metrics["median_new_share"] else "FAIL",
+                    5: "PASS" if metrics["operating_margin_pct"] > metrics["median_margin"] else "FAIL",
+                }
+                fallback = _fallback_summary(metrics, points)
+                summary = fallback
+
+                if agent is not None:
+                    prompt = (
+                        "Write a concise two- or three-sentence investment-research summary "
+                        "explaining all three Fisher verdicts below. Use only the supplied "
+                        "figures, preserve every verdict and number, and do not perform new "
+                        "calculations. Return plain prose only.\n\n" + fallback
+                    )
+                    try:
+                        response = await asyncio.wait_for(
+                            agent.ainvoke([
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You summarize verified financial evidence. Never "
+                                        "change a verdict or numerical value supplied by the user."
+                                    ),
+                                },
+                                {"role": "user", "content": prompt},
+                            ]),
+                            timeout=120,
+                        )
+                        generated = _message_text(response)
+                        if generated:
+                            summary = generated
+                    except Exception as exc:
+                        print(f"Warning: {name} summary model call failed: {exc}")
+
+                return name, {"points": points, "summary": summary}
+            except Exception as exc:
+                print(f"Warning: {name} analysis failed: {exc}")
+                return name, {
+                    "points": {point: "FAIL" for point in CHOSEN_POINTS},
+                    "summary": f"Analysis failed safely for this company: {exc}",
+                }
+
+    pairs = await asyncio.gather(
+        *(analyze_one(name, tools) for name, tools in companies.items())
+    )
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
